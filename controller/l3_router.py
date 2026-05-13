@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-SDN Layer 3 Router (Phase 3 - Complete)
-Acts as a virtual gateway, rewrites MAC addresses, and uses 
-mathematical topology logic to route packets without flooding.
+CS4068 SDN Load Balancer - Phase 4: Round Robin Server Load Balancing (Baseline)
+Integrates a Virtual IP (VIP), IP Header Rewriting (NAT), and a Round Robin selection algorithm.
 """
 
 from ryu.base import app_manager
@@ -10,7 +9,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types, arp, ipv4, icmp, in_proto
-
+from ryu.lib import hub
 class L3Router(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -18,10 +17,19 @@ class L3Router(app_manager.RyuApp):
         super(L3Router, self).__init__(*args, **kwargs)
         self.ROUTER_MAC = 'aa:bb:cc:dd:ee:ff'
 
+        self.VIP = '10.0.0.100' 
+        self.SERVER_POOL = ['10.0.3.1', '10.0.3.2', '10.0.4.1', '10.0.4.2']
+        
+        # --- NEW: DYNAMIC METRICS TRACKER ---
+        # Initialize all servers with 0 load
+        self.server_load = {server: 0 for server in self.SERVER_POOL}
+        
+        # Spawn a background thread that runs independently of packet processing
+        self.monitor_thread = hub.spawn(self._monitor_server_load)
+
         self.arp_table = {}
         host_global_counter = 1
         
-        # Generates exact IP and MAC pairs matching the fat_tree.py generation
         for pod in range(4):
             subnet = pod + 1
             host_pod_counter = 1
@@ -37,37 +45,50 @@ class L3Router(app_manager.RyuApp):
                 host_global_counter += 1
                 host_pod_counter += 1
 
-    def calculate_routing(self, dpid_str, dst_ip):
-        """ The Mathematical Fat-Tree Routing Engine """
+    def _monitor_server_load(self):
+        """ Background Thread: Simulates connection decay and prints a live load dashboard """
+        while True:
+            hub.sleep(5) # Run every 5 seconds
+            
+            self.logger.info("=== [LIVE SERVER METRICS] ===")
+            for server in self.SERVER_POOL:
+                # Decay the load by 1 (minimum 0) to simulate finished requests
+                if self.server_load[server] > 0:
+                    self.server_load[server] -= 1
+                
+                self.logger.info("Server: %s | Current Active Load: %s", server, self.server_load[server])
+            self.logger.info("=============================")
+
+    def calculate_routing(self, dpid_str, src_ip, dst_ip):
+        """ The 100% ECMP Load Balancer Routing Engine """
         layer = dpid_str[0]
         target_pod = int(dst_ip.split('.')[2]) - 1
         host_id = int(dst_ip.split('.')[3])
 
-        if layer == '1': # Core Switch Layer
+        src_last_octet = int(src_ip.split('.')[3])
+        dst_last_octet = int(dst_ip.split('.')[3])
+        uplink_port = ((src_last_octet + dst_last_octet) % 2) + 1
+
+        if layer == '1': 
             return target_pod + 1
             
-        elif layer == '2': # Aggregation Switch Layer
+        elif layer == '2': 
             current_pod = int(dpid_str[1])
             if current_pod == target_pod:
                 edge_idx = (host_id - 1) // 2
                 return edge_idx + 3
             else:
-                return 1
+                return uplink_port 
                 
-        elif layer == '3': # Edge Switch Layer
+        elif layer == '3': 
             current_pod = int(dpid_str[1])
-            
-            # Identify if we are Edge switch 1 or 2
             current_edge_idx = int(dpid_str[3]) 
-            # Identify if the target host lives on Edge 1 or 2
             target_edge_idx = ((host_id - 1) // 2) + 1 
 
             if current_pod == target_pod and current_edge_idx == target_edge_idx:
-                # Host is on THIS specific edge switch. Route DOWN.
                 return ((host_id - 1) % 2) + 3
             else:
-                # Host is in another pod, OR on the other edge switch in this pod. Route UP.
-                return 1
+                return uplink_port 
         return 1
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -115,20 +136,17 @@ class L3Router(app_manager.RyuApp):
 
         dst_ip = arp_pkt.dst_ip
 
-        # --- THE FIX: PROXY ARP ---
-        # 1. Is the host asking for the Default Gateway?
-        if dst_ip.endswith('.254'):
+        # NEW: Answer ARP requests for the Virtual IP
+        if dst_ip == self.VIP:
             reply_mac = self.ROUTER_MAC
-            
-        # 2. Is the host asking for another specific host in the same subnet?
+            self.logger.info("ARP Proxy: Intercepted request for Virtual IP %s", dst_ip)
+        elif dst_ip.endswith('.254'):
+            reply_mac = self.ROUTER_MAC
         elif dst_ip in self.arp_table:
             reply_mac = self.arp_table[dst_ip]['mac']
-            
-        # 3. We don't know this IP. Drop it.
         else:
             return 
 
-        # Construct the targeted ARP Reply
         reply_pkt = packet.Packet()
         reply_eth = ethernet.ethernet(dst=eth.src, src=reply_mac, ethertype=ether_types.ETH_TYPE_ARP)
         reply_arp = arp.arp(opcode=arp.ARP_REPLY, src_mac=reply_mac, src_ip=dst_ip,
@@ -138,7 +156,6 @@ class L3Router(app_manager.RyuApp):
         reply_pkt.add_protocol(reply_arp)
         reply_pkt.serialize()
 
-        # Shoot the packet back to the host that asked
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         actions = [parser.OFPActionOutput(in_port)]
@@ -147,53 +164,80 @@ class L3Router(app_manager.RyuApp):
         datapath.send_msg(out)
 
     def handle_ipv4(self, msg, datapath, in_port, pkt, eth, ipv4_pkt):
-        # 1. Is it for the gateway?
         if ipv4_pkt.dst.endswith('.254'):
             if ipv4_pkt.proto == in_proto.IPPROTO_ICMP:
                 self.handle_icmp(msg, datapath, in_port, pkt, eth, ipv4_pkt)
             return
 
-        # 2. It is for another host. Route it.
+        src_ip = ipv4_pkt.src
         dst_ip = ipv4_pkt.dst
-        if dst_ip not in self.arp_table:
-            return 
-
-        # THE FATAL BUG FIX: Convert Ryu's integer DPID back into the exact Hex string we assigned in Mininet
-        # e.g., 4097 -> '1001'
-        dpid_hex = format(datapath.id, "x")
-        
-        # Fallback safeguard
-        if len(dpid_hex) < 4:
-            dpid_hex = dpid_hex.zfill(4)
-
-        # Use math to figure out the port
-        out_port = self.calculate_routing(dpid_hex, dst_ip)
-        
-        # --- NEW LOGGING: Watch the Brain Work ---
-        self.logger.info("ROUTING: Switch %s | Dest IP: %s -> Sending out Port %s", dpid_hex, dst_ip, out_port)
-
-        target_mac = self.arp_table[dst_ip]['mac']
 
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        dpid_hex = format(datapath.id, "x").zfill(4)
 
-        actions = [
-            parser.OFPActionSetField(eth_src=self.ROUTER_MAC),
-            parser.OFPActionSetField(eth_dst=target_mac),
-            parser.OFPActionOutput(out_port)
-        ]
+        # ---------------------------------------------------------
+        # SCENARIO A: Client is sending traffic TO the Virtual IP
+        # ---------------------------------------------------------
+        if dst_ip == self.VIP:
+            # --- THE DYNAMIC ALGORITHM: Least-Loaded Server ---
+            # Find the server in the pool with the minimum current load value
+            selected_server = min(self.server_load, key=self.server_load.get)
+            
+            # Artificially spike the load for this server by 3 so the algorithm 
+            # is forced to pick a different server for the next immediate request
+            self.server_load[selected_server] += 3
+            
+            target_mac = self.arp_table[selected_server]['mac']
+            out_port = self.calculate_routing(dpid_hex, src_ip, selected_server)
+            
+            self.logger.info("DYNAMIC SLB: VIP Request from %s routed to Least-Loaded Server %s (Load spiked to %s)", 
+                             src_ip, selected_server, self.server_load[selected_server])
 
-        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=dst_ip)
-        
+            actions = [
+                parser.OFPActionSetField(eth_dst=target_mac),
+                parser.OFPActionSetField(ipv4_dst=selected_server),
+                parser.OFPActionOutput(out_port)
+            ]
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=self.VIP)
+
+        # ---------------------------------------------------------
+        # SCENARIO B: Server is replying back to a Client
+        # ---------------------------------------------------------
+        elif src_ip in self.SERVER_POOL and dst_ip not in self.SERVER_POOL and dst_ip != self.VIP:
+            target_mac = self.arp_table[dst_ip]['mac']
+            out_port = self.calculate_routing(dpid_hex, src_ip, dst_ip)
+
+            # SOURCE NAT: Rewrite the source IP so it looks like the VIP replied
+            actions = [
+                parser.OFPActionSetField(eth_dst=target_mac),
+                parser.OFPActionSetField(ipv4_src=self.VIP),
+                parser.OFPActionOutput(out_port)
+            ]
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
+
+        # ---------------------------------------------------------
+        # SCENARIO C: Normal Host-to-Host network traffic
+        # ---------------------------------------------------------
+        elif dst_ip in self.arp_table:
+            target_mac = self.arp_table[dst_ip]['mac']
+            out_port = self.calculate_routing(dpid_hex, src_ip, dst_ip)
+            
+            actions = [
+                parser.OFPActionSetField(eth_dst=target_mac),
+                parser.OFPActionOutput(out_port)
+            ]
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
+        else:
+            return # Drop unknown IPs
+
+        # Install the flow and forward the packet
         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
             self.add_flow(datapath, 10, match, actions, msg.buffer_id)
         else:
             self.add_flow(datapath, 10, match, actions)
 
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-
+        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
