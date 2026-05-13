@@ -11,7 +11,7 @@ from mininet.node import RemoteController, OVSSwitch
 from mininet.link import TCLink
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
-
+import time
 class L3FatTreeTopo(Topo):
     def build(self):
         k = 4
@@ -78,6 +78,66 @@ class L3FatTreeTopo(Topo):
                     host_global_counter += 1
                     host_pod_counter += 1
 
+# --- AUTOMATION SCRIPT ---
+def automated_demo(net):
+    print("\n" + "="*60)
+    print(" SYSTEM AUTOMATION: DYNAMIC LOAD BALANCER STRESS TEST")
+    print(" Press [Ctrl+C] at any time to halt the loop and enter CLI.")
+    print("="*60)
+    
+    clients = [net.get('h0_1'), net.get('h0_2'), net.get('h0_3'), net.get('h0_4')]
+    servers = [net.get('s2_9'), net.get('s2_10'), net.get('s3_13'), net.get('s3_14')]
+
+    print("\n[INIT] Booting Backend TCP Listeners")
+    print("[EXEC] Running 'iperf -s &' on s2_9, s2_10, s3_13, s3_14")
+    for server in servers:
+        server.cmd('iperf -s &')
+    
+    print("[PAUSE] 5 seconds: Allowing TCP daemons to initialize.\n")
+    time.sleep(5)
+
+    iteration = 1
+    try:
+        while True:
+            print(f"\n--- BEGIN TEST ITERATION {iteration} ---")
+            
+            # --- SINGLE REQUEST ROUTING ---
+            print("[PHASE 1] Single Request Routing")
+            print("[EXEC] h0_1 executing: 'iperf -c 10.0.0.100 -t 3 &'")
+            clients[0].cmd('iperf -c 10.0.0.100 -t 3 &')
+            
+            print("[PAUSE] 10 seconds: Waiting 3s for TCP transfer completion and 7s for server load metrics to decay to 0.")
+            time.sleep(10)
+
+            # --- CONCURRENT FLASH CROWD ---
+            print("\n[PHASE 2] Concurrent 'Flash Crowd' Stress Test")
+            print("[EXEC] h0_1, h0_2, h0_3, h0_4 simultaneously executing: 'iperf -c 10.0.0.100 -t 5 &'")
+            for client in clients:
+                client.cmd('iperf -c 10.0.0.100 -t 5 &')
+                
+            print("[PAUSE] 15 seconds: Waiting 5s for TCP transfers completion and 10s for server load metrics to decay to 0.")
+            time.sleep(15)
+
+            print(f"--- END TEST ITERATION {iteration} ---\n")
+            iteration += 1
+
+    except KeyboardInterrupt:
+        # --- GRACEFUL EXIT ---
+        print("\n\n[!] Interrupt Signal (Ctrl+C) Detected.")
+        print("[CLEANUP] Terminating all background iperf TCP sockets to prevent Mininet zombie processes...")
+        
+        for server in servers:
+            server.cmd('killall -9 iperf')
+        for client in clients:
+            client.cmd('killall -9 iperf')
+            
+        print("[CLEANUP] TCP environment sanitized.")
+        print("="*60)
+        print(" Dropping to manual Mininet CLI.")
+        print("="*60)
+
+
+# --- TOPOLOGY EXECUTION ---
 def run_topology():
     topo = L3FatTreeTopo() 
     net = Mininet(topo=topo, build=False, link=TCLink, switch=OVSSwitch)
@@ -87,7 +147,11 @@ def run_topology():
     net.build()  
     info("*** Starting Network\n")
     net.start()
-    info("*** Entering CLI\n")
+    
+    # Trigger the automated infinite loop
+    automated_demo(net)
+    
+    # Opens the command line only AFTER the user hits Ctrl+C
     CLI(net)     
     info("*** Stopping Network\n")
     net.stop()   
@@ -95,3 +159,7 @@ def run_topology():
 if __name__ == '__main__':
     setLogLevel('info')
     run_topology()
+    
+    
+    
+    

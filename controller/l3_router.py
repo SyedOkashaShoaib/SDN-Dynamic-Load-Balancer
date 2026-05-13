@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-CS4068 SDN Load Balancer - Phase 4: Round Robin Server Load Balancing (Baseline)
-Integrates a Virtual IP (VIP), IP Header Rewriting (NAT), and a Round Robin selection algorithm.
+CS4068 SDN Load Balancer - Phase 5: REST API Integration
+Integrates Ryu's WSGI server to expose real-time load metrics to a frontend dashboard.
 """
 
+import json
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types, arp, ipv4, icmp, in_proto
 from ryu.lib import hub
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route
+from webob import Response
+
 class L3Router(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    
+    # --- NEW: Tell Ryu to load the WSGI Web Server ---
+    _CONTEXTS = {'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super(L3Router, self).__init__(*args, **kwargs)
@@ -20,12 +27,12 @@ class L3Router(app_manager.RyuApp):
         self.VIP = '10.0.0.100' 
         self.SERVER_POOL = ['10.0.3.1', '10.0.3.2', '10.0.4.1', '10.0.4.2']
         
-        # --- NEW: DYNAMIC METRICS TRACKER ---
-        # Initialize all servers with 0 load
         self.server_load = {server: 0 for server in self.SERVER_POOL}
-        
-        # Spawn a background thread that runs independently of packet processing
         self.monitor_thread = hub.spawn(self._monitor_server_load)
+
+        # --- NEW: Register the REST API endpoint ---
+        wsgi = kwargs['wsgi']
+        wsgi.register(LoadBalancerAPI, {'l3_router': self})
 
         self.arp_table = {}
         host_global_counter = 1
@@ -46,21 +53,19 @@ class L3Router(app_manager.RyuApp):
                 host_pod_counter += 1
 
     def _monitor_server_load(self):
-        """ Background Thread: Simulates connection decay and prints a live load dashboard """
+        """ Background Thread: Simulates connection decay """
         while True:
-            hub.sleep(5) # Run every 5 seconds
-            
+            hub.sleep(5) 
+            # (Optional: You can comment out these print statements later if the terminal gets too noisy, 
+            # since the web dashboard will be doing the visualizing soon).
             self.logger.info("=== [LIVE SERVER METRICS] ===")
             for server in self.SERVER_POOL:
-                # Decay the load by 1 (minimum 0) to simulate finished requests
                 if self.server_load[server] > 0:
                     self.server_load[server] -= 1
-                
                 self.logger.info("Server: %s | Current Active Load: %s", server, self.server_load[server])
             self.logger.info("=============================")
 
     def calculate_routing(self, dpid_str, src_ip, dst_ip):
-        """ The 100% ECMP Load Balancer Routing Engine """
         layer = dpid_str[0]
         target_pod = int(dst_ip.split('.')[2]) - 1
         host_id = int(dst_ip.split('.')[3])
@@ -71,7 +76,6 @@ class L3Router(app_manager.RyuApp):
 
         if layer == '1': 
             return target_pod + 1
-            
         elif layer == '2': 
             current_pod = int(dpid_str[1])
             if current_pod == target_pod:
@@ -79,7 +83,6 @@ class L3Router(app_manager.RyuApp):
                 return edge_idx + 3
             else:
                 return uplink_port 
-                
         elif layer == '3': 
             current_pod = int(dpid_str[1])
             current_edge_idx = int(dpid_str[3]) 
@@ -100,18 +103,19 @@ class L3Router(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    idle_timeout=idle_timeout,
                                     priority=priority, match=match, instructions=inst)
         else:
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    idle_timeout=idle_timeout,
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -136,10 +140,8 @@ class L3Router(app_manager.RyuApp):
 
         dst_ip = arp_pkt.dst_ip
 
-        # NEW: Answer ARP requests for the Virtual IP
         if dst_ip == self.VIP:
             reply_mac = self.ROUTER_MAC
-            self.logger.info("ARP Proxy: Intercepted request for Virtual IP %s", dst_ip)
         elif dst_ip.endswith('.254'):
             reply_mac = self.ROUTER_MAC
         elif dst_ip in self.arp_table:
@@ -171,29 +173,17 @@ class L3Router(app_manager.RyuApp):
 
         src_ip = ipv4_pkt.src
         dst_ip = ipv4_pkt.dst
-
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         dpid_hex = format(datapath.id, "x").zfill(4)
 
-        # ---------------------------------------------------------
-        # SCENARIO A: Client is sending traffic TO the Virtual IP
-        # ---------------------------------------------------------
         if dst_ip == self.VIP:
-            # --- THE DYNAMIC ALGORITHM: Least-Loaded Server ---
-            # Find the server in the pool with the minimum current load value
             selected_server = min(self.server_load, key=self.server_load.get)
-            
-            # Artificially spike the load for this server by 3 so the algorithm 
-            # is forced to pick a different server for the next immediate request
             self.server_load[selected_server] += 3
             
             target_mac = self.arp_table[selected_server]['mac']
             out_port = self.calculate_routing(dpid_hex, src_ip, selected_server)
             
-            self.logger.info("DYNAMIC SLB: VIP Request from %s routed to Least-Loaded Server %s (Load spiked to %s)", 
-                             src_ip, selected_server, self.server_load[selected_server])
-
             actions = [
                 parser.OFPActionSetField(eth_dst=target_mac),
                 parser.OFPActionSetField(ipv4_dst=selected_server),
@@ -201,14 +191,10 @@ class L3Router(app_manager.RyuApp):
             ]
             match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=self.VIP)
 
-        # ---------------------------------------------------------
-        # SCENARIO B: Server is replying back to a Client
-        # ---------------------------------------------------------
         elif src_ip in self.SERVER_POOL and dst_ip not in self.SERVER_POOL and dst_ip != self.VIP:
             target_mac = self.arp_table[dst_ip]['mac']
             out_port = self.calculate_routing(dpid_hex, src_ip, dst_ip)
 
-            # SOURCE NAT: Rewrite the source IP so it looks like the VIP replied
             actions = [
                 parser.OFPActionSetField(eth_dst=target_mac),
                 parser.OFPActionSetField(ipv4_src=self.VIP),
@@ -216,9 +202,6 @@ class L3Router(app_manager.RyuApp):
             ]
             match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
 
-        # ---------------------------------------------------------
-        # SCENARIO C: Normal Host-to-Host network traffic
-        # ---------------------------------------------------------
         elif dst_ip in self.arp_table:
             target_mac = self.arp_table[dst_ip]['mac']
             out_port = self.calculate_routing(dpid_hex, src_ip, dst_ip)
@@ -229,19 +212,19 @@ class L3Router(app_manager.RyuApp):
             ]
             match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip)
         else:
-            return # Drop unknown IPs
+            return 
 
         # Install the flow and forward the packet
+        # Install the flow with a 5-second idle timeout
         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-            self.add_flow(datapath, 10, match, actions, msg.buffer_id)
+            self.add_flow(datapath, 10, match, actions, msg.buffer_id, idle_timeout=5)
+            return 
         else:
-            self.add_flow(datapath, 10, match, actions)
+            self.add_flow(datapath, 10, match, actions, idle_timeout=5)
 
-        data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=in_port, actions=actions, data=msg.data)
         datapath.send_msg(out)
-
     def handle_icmp(self, msg, datapath, in_port, pkt, eth, ipv4_pkt):
         icmp_pkt = pkt.get_protocols(icmp.icmp)[0]
         if icmp_pkt.type != icmp.ICMP_ECHO_REQUEST:
@@ -250,8 +233,7 @@ class L3Router(app_manager.RyuApp):
         reply_pkt = packet.Packet()
         reply_eth = ethernet.ethernet(dst=eth.src, src=self.ROUTER_MAC, ethertype=ether_types.ETH_TYPE_IP)
         reply_ipv4 = ipv4.ipv4(dst=ipv4_pkt.src, src=ipv4_pkt.dst, proto=ipv4_pkt.proto)
-        reply_icmp = icmp.icmp(type_=icmp.ICMP_ECHO_REPLY, code=icmp.ICMP_ECHO_REPLY_CODE, 
-                               csum=0, data=icmp_pkt.data)
+        reply_icmp = icmp.icmp(type_=icmp.ICMP_ECHO_REPLY, code=icmp.ICMP_ECHO_REPLY_CODE, csum=0, data=icmp_pkt.data)
 
         reply_pkt.add_protocol(reply_eth)
         reply_pkt.add_protocol(reply_ipv4)
@@ -264,3 +246,21 @@ class L3Router(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
                                   in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=reply_pkt.data)
         datapath.send_msg(out)
+
+# --- NEW: The REST API Definition ---
+class LoadBalancerAPI(ControllerBase):
+    def __init__(self, req, link, data, **config):
+        super(LoadBalancerAPI, self).__init__(req, link, data, **config)
+        # Pull the reference to our running L3Router so we can read its data
+        self.l3_router = data['l3_router']
+
+    # Define the exact URL endpoint. Using GET method.
+    @route('loadbalancer', '/metrics', methods=['GET'])
+    def get_metrics(self, req, **kwargs):
+        # Package the dictionary into a JSON string AND encode it to raw bytes
+        body = json.dumps(self.l3_router.server_load).encode('utf-8')
+        
+        # Create the HTTP response and append the CORS header
+        response = Response(content_type='application/json', body=body)
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response

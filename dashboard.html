@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDN Dynamic Load Balancer</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px;
+        }
+        .dashboard-container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+            width: 80%;
+            max-width: 800px;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+        p.subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+        }
+        .status-dot {
+            height: 12px;
+            width: 12px;
+            background-color: #e74c3c; /* Red initially */
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .status-text {
+            font-weight: bold;
+            color: #e74c3c;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard-container">
+        <h1>SDN Load Balancer</h1>
+        <p class="subtitle">Real-Time Routing & Server Load Visualization</p>
+        
+        <div style="margin-bottom: 20px; text-align: center;">
+            <span class="status-dot" id="connection-dot"></span>
+            <span class="status-text" id="connection-status">API Disconnected</span>
+        </div>
+
+        <canvas id="loadChart"></canvas>
+    </div>
+
+    <script>
+        // --- 1. SETUP THE CHART ---
+        const ctx = document.getElementById('loadChart').getContext('2d');
+        const loadChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['Server 10.0.3.1', 'Server 10.0.3.2', 'Server 10.0.4.1', 'Server 10.0.4.2'],
+                datasets: [{
+                    label: 'Current Active Load (Weight)',
+                    data: [0, 0, 0, 0], // Starting at zero
+                    backgroundColor: [
+                        'rgba(52, 152, 219, 0.7)',
+                        'rgba(46, 204, 113, 0.7)',
+                        'rgba(155, 89, 182, 0.7)',
+                        'rgba(241, 196, 15, 0.7)'
+                    ],
+                    borderColor: [
+                        'rgba(41, 128, 185, 1)',
+                        'rgba(39, 174, 96, 1)',
+                        'rgba(142, 68, 173, 1)',
+                        'rgba(243, 156, 18, 1)'
+                    ],
+                    borderWidth: 2,
+                    borderRadius: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        suggestedMax: 10,
+                        title: {
+                            display: true,
+                            text: 'Load Value'
+                        }
+                    }
+                },
+                animation: {
+                    duration: 300 // Snappy animation for real-time feel
+                }
+            }
+        });
+
+        // --- 2. FETCH DATA FROM RYU API ---
+        async function fetchMetrics() {
+            try {
+                // Call the local Ryu endpoint
+                const response = await fetch('http://localhost:8080/metrics');
+                const data = await response.json();
+                
+                // Update UI to show connected status
+                document.getElementById('connection-dot').style.backgroundColor = '#2ecc71';
+                document.getElementById('connection-status').innerText = 'API Connected (Live)';
+                document.getElementById('connection-status').style.color = '#2ecc71';
+
+                // Map the JSON data directly into the chart's data array
+                loadChart.data.datasets[0].data = [
+                    data['10.0.3.1'],
+                    data['10.0.3.2'],
+                    data['10.0.4.1'],
+                    data['10.0.4.2']
+                ];
+                
+                // Tell the chart to redraw
+                loadChart.update();
+
+            } catch (error) {
+                // If Ryu is off or the API fails, show disconnected status
+                document.getElementById('connection-dot').style.backgroundColor = '#e74c3c';
+                document.getElementById('connection-status').innerText = 'API Disconnected...';
+                document.getElementById('connection-status').style.color = '#e74c3c';
+            }
+        }
+
+        // --- 3. THE LIVE LOOP ---
+        // Run the fetch function every 500 milliseconds (half a second)
+        setInterval(fetchMetrics, 500);
+    </script>
+</body>
+</html>
